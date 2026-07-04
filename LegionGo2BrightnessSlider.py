@@ -30,6 +30,7 @@ https://www.reddit.com/r/LegionGo/comments/1s4mhlu/legion_go_2_steamos_display_f
 '''
 
 import os
+import pwd
 import sys
 
 from ShellUtils import run_command
@@ -83,19 +84,65 @@ gamescope.config.known_displays.lenovo_go2_oled = {
 debug("Registered AMS881KB01-0 OLED as a known display")
 '''
 
-def enable_lego2_brightness_slider(dry_run=True):
-    print('\nNow creating gamemode scripts directory')
-    scripts_dir = '/home/deck/.config/gamescope/scripts'
-    command = ['mkdir', '-p', scripts_dir]
-    run_command(command, dry_run)
+def get_target_user():
+    # Gamescope loads user scripts from the home of the user it runs as (e.g.
+    # 'deck'), which lives in the home partition and survives SteamOS updates.
+    # When invoked via sudo we must target the *invoking* user's home, not
+    # root's, otherwise gamescope would never read the file.
+    sudo_user = os.environ.get('SUDO_USER')
+    if sudo_user and sudo_user != 'root':
+        try:
+            pw = pwd.getpwnam(sudo_user)
+            return pw.pw_dir, pw.pw_uid, pw.pw_gid
+        except KeyError:
+            pass
+    return os.path.expanduser('~'), os.getuid(), os.getgid()
 
-    if not os.path.exists(scripts_dir) or not os.path.isdir(scripts_dir):
-        print('Unable to create Gamemode scripts directory: %s' % scripts_dir)
+def get_scripts_dir():
+    home, _uid, _gid = get_target_user()
+    return os.path.join(home, '.config', 'gamescope', 'scripts')
+
+def reassign_ownership(home, scripts_dir, uid, gid):
+    # When running as root (via sudo) the dirs/files we just created are owned
+    # by root. Hand them back to the target user so gamescope can read them and
+    # the user can manage/remove them later without sudo.
+    if os.geteuid() != 0:
+        return
+    paths = [
+        os.path.join(home, '.config'),
+        os.path.join(home, '.config', 'gamescope'),
+        scripts_dir,
+    ]
+    for path in paths:
+        try:
+            os.chown(path, uid, gid)
+        except OSError:
+            pass
+
+def print_reboot_notice():
+    print('\nA reboot (or a full restart of Game Mode / gamescope) is required for this change to take effect,')
+    print('because gamescope only loads display scripts at startup.')
+
+def enable_lego2_brightness_slider(dry_run=True):
+    home, uid, gid = get_target_user()
+    scripts_dir = get_scripts_dir()
+    gamemode_script_filename = os.path.join(scripts_dir, 'lenovo.legiongo2.oled.lua')
+
+    if dry_run:
+        print('\n[dry-run] Would create gamemode scripts directory: %s' % scripts_dir)
+        print('[dry-run] Would write gamemode script to: %s' % gamemode_script_filename)
+        print('[dry-run] Script contents:\n%s' % brightness_slider_and_color_correction_script)
+        return True
+
+    print('\nNow creating gamemode scripts directory: %s' % scripts_dir)
+    try:
+        os.makedirs(scripts_dir, exist_ok=True)
+    except OSError as e:
+        print(f'Unable to create Gamemode scripts directory: {scripts_dir} ({e})')
         return False
 
     print('Gamemode scripts directory: %s successfully created' % scripts_dir)
 
-    gamemode_script_filename = os.path.join(scripts_dir, 'lenovo.legiongo2.oled.lua')
     try:
         with open(gamemode_script_filename, 'w', encoding='utf-8') as file:
             file.write(brightness_slider_and_color_correction_script)
@@ -104,17 +151,28 @@ def enable_lego2_brightness_slider(dry_run=True):
         print('Error: Permission denied. Unable to write gamemode script to: %s' % gamemode_script_filename)
         return False
     except OSError as e:
-        print('OS error occurred: {e}')
+        print(f'OS error occurred: {e}')
         return False
     except Exception as e:
-        print('An unexpected error occurred: {e}')
+        print(f'An unexpected error occurred: {e}')
         return False
 
+    reassign_ownership(home, scripts_dir, uid, gid)
+    try:
+        if os.geteuid() == 0:
+            os.chown(gamemode_script_filename, uid, gid)
+    except OSError:
+        pass
+
+    print_reboot_notice()
     return True
 
 def remove_lego2_brightness_slider(dry_run=True):
     print('\nNow removing Legion Go 2 brightness slider and color correction fix')
-    scripts_dir = '/home/deck/.config/gamescope/scripts'
+    scripts_dir = get_scripts_dir()
     gamemode_script_filename = os.path.join(scripts_dir, 'lenovo.legiongo2.oled.lua')
     command = ['rm', '-rf', gamemode_script_filename]
     run_command(command, dry_run)
+
+    if not dry_run:
+        print_reboot_notice()
